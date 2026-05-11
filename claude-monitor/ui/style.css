@@ -156,8 +156,9 @@ body:hover {
   flex-shrink: 0;
 }
 
-.status-indicator.active { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
+.status-indicator.active  { background: var(--accent-green); box-shadow: 0 0 4px var(--accent-green); }
 .status-indicator.idle    { background: var(--accent-yellow); box-shadow: 0 0 4px var(--accent-yellow); }
+.status-indicator.waiting { background: #ff9800; box-shadow: 0 0 6px #ff9800; animation: pulse-waiting 1.5s ease-in-out infinite; }
 .status-indicator.stopped { background: var(--accent-grey); }
 
 .card-title {
@@ -209,6 +210,29 @@ body:hover {
   font-size: 10px;
   color: var(--text-dim);
   opacity: 0.7;
+}
+
+/* ── waiting 脉冲动画 ────────────────── */
+@keyframes pulse-waiting {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ── waiting 卡片样式 ────────────────── */
+.card.waiting {
+  border-color: rgba(255, 152, 0, 0.55);
+  box-shadow: 0 0 14px rgba(255, 152, 0, 0.18);
+}
+
+.card-waiting {
+  font-size: 11px;
+  color: #ff9800;
+  font-weight: 600;
+  margin: 0 12px 6px 12px;
+  padding: 3px 8px;
+  background: rgba(255, 152, 0, 0.12);
+  border-radius: 4px;
+  display: inline-block;
 }
 
 /* ── stopped 闪烁提示 ──────────────────── */

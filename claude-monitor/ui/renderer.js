@@ -66,10 +66,13 @@ function renderCard(session) {
     session_id, cwd, status, model, context_pct,
     cost, duration, last_event, last_tool,
     recent_tools, stop_reason, last_update, stopped_at,
-    _just_stopped
+    pid_waiting_for, _just_stopped
   } = session
 
-  const statusLabel = status === 'active' ? 'active' : status === 'idle' ? 'idle' : 'stopped'
+  const statusLabel = status === 'active' ? 'active'
+    : status === 'idle' ? 'idle'
+    : status === 'waiting' ? 'waiting'
+    : 'stopped'
   const dirName = cwd ? cwd.split(/[\\/]/).filter(Boolean).pop() || cwd : 'unknown'
   const title = session.display_name || dirName
 
@@ -84,19 +87,26 @@ function renderCard(session) {
     ? `${last_event} (${stop_reason})`
     : last_event + (last_tool ? `: ${last_tool}` : '')
 
-  const extraClass = _just_stopped ? ' just-stopped' : ''
-  const canDismiss = status === 'stopped' || status === 'idle'
+  const waitingText = (status === 'waiting' && pid_waiting_for)
+    ? `<div class="card-waiting">Awaiting: ${escHtml(pid_waiting_for)}</div>`
+    : ''
+
+  const extraClasses = []
+  if (_just_stopped) extraClasses.push('just-stopped')
+  if (status === 'waiting') extraClasses.push('waiting')
+  const extraClassStr = extraClasses.length > 0 ? ' ' + extraClasses.join(' ') : ''
 
   return `
-    <div class="card ${status}${extraClass}"
+    <div class="card ${status}${extraClassStr}"
          data-session-id="${session_id}"
          ${status === 'stopped' ? 'onclick="toggleStoppedCard(event, this)"' : ''}>
       <div class="card-header">
         <span class="status-indicator ${statusLabel}"></span>
         <span class="card-title">${statusLabel} ${escHtml(title)}</span>
         ${status === 'stopped' ? '<span class="expand-hint">▼</span>' : ''}
-        ${canDismiss ? `<button class="dismiss-btn" onclick="dismissCard(event, '${session_id}')" title="关闭">×</button>` : ''}
+        <button class="dismiss-btn" onclick="dismissCard(event, '${session_id}')" title="Remove">×</button>
       </div>
+      ${waitingText}
       <div class="card-details">
         <div class="card-path">${escHtml(cwd || '')}</div>
         <div class="card-stats">
@@ -150,15 +160,13 @@ function render(sessions) {
     expandedIds.add(el.dataset.sessionId)
   })
 
-  // 检测新停止 → 提示音
-  let hasNewStop = false
+  // 检测新停止或新等待 → 提示音
+  let hasAlert = false
   for (const s of sessions) {
-    if (s._just_stopped) {
-      hasNewStop = true
-      break
-    }
+    if (s._just_stopped) { hasAlert = true; break }
+    if (s.status === 'waiting' && s._just_waiting) { hasAlert = true; break }
   }
-  if (hasNewStop) playBeep()
+  if (hasAlert) playBeep()
 
   container.innerHTML = sessions.map(renderCard).join('')
 

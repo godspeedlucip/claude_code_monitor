@@ -215,7 +215,7 @@ function startServer() {
 
   server.post('/claude/status', (req, res) => {
     try {
-      sessions.update(req.body.session_id, req.body)
+      sessions.enrich(req.body.session_id, req.body)
       res.json({ ok: true })
     } catch (e) {
       console.error('[server] /claude/status error:', e.message)
@@ -225,7 +225,7 @@ function startServer() {
 
   server.post('/claude/hook', (req, res) => {
     try {
-      sessions.update(req.body.session_id, req.body)
+      sessions.enrich(req.body.session_id, req.body)
       res.json({ ok: true })
     } catch (e) {
       console.error('[server] /claude/hook error:', e.message)
@@ -239,6 +239,16 @@ function startServer() {
       res.json({ ok: true, sessions: list, count: list.length })
     } catch (e) {
       console.error('[server] /api/sessions error:', e.message)
+      res.status(500).json({ ok: false, error: e.message })
+    }
+  })
+
+  server.delete('/api/sessions/:id', (req, res) => {
+    try {
+      sessions.remove(req.params.id)
+      res.json({ ok: true })
+    } catch (e) {
+      console.error('[server] DELETE /api/sessions error:', e.message)
       res.status(500).json({ ok: false, error: e.message })
     }
   })
@@ -281,6 +291,7 @@ app.whenReady().then(async () => {
 
   try {
     await startServer()
+    sessions.startPolling()
   } catch (e) {
     console.error('[app] failed to start server:', e.message)
   }
