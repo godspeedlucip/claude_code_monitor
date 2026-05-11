@@ -1,0 +1,26 @@
+# claudepot-app（按要求排除）
+claudepot-app/
+
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+out/
+target/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo

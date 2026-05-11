@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Claude Code Monitor</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="titlebar">
+    <span class="title">Claude Code Monitor</span>
+    <span id="status-dot" class="dot disconnected" title="服务状态"></span>
+  </header>
+
+  <main id="cards-container">
+    <div id="empty-state" class="empty">
+      <p>等待 Claude Code 会话...</p>
+      <p class="hint">启动 Claude Code 后，会话卡片将自动出现</p>
+    </div>
+  </main>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

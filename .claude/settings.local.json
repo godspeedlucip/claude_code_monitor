@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs",
+      "Bash(git -C \"D:\\\\desktop\\\\claude\\\\my_temp_skill\\\\claude悬浮管理窗\" log --oneline -10)",
+      "Bash(npm install *)",
+      "Bash(curl *)",
+      "Bash(python -m json.tool)",
+      "Bash(powershell *)",
+      "Bash(cmd.exe *)",
+      "Bash(cmd *)"
+    ]
+  }
+}
