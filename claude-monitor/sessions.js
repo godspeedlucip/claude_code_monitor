@@ -16,6 +16,7 @@ const { EventEmitter } = require('events')
 const fs = require('fs')
 const path = require('path')
 const os = require('os')
+const { exec } = require('child_process')
 
 // ── 常量 ──────────────────────────────────────────────
 const PID_DIR = path.join(os.homedir(), '.claude', 'sessions')
@@ -24,6 +25,7 @@ const TICK_MS = 500
 const IDLE_THRESHOLD_MS = 30 * 1000
 const EXPIRE_STOPPED_MS = 10 * 1000
 const EXPIRE_IDLE_MS = 5 * 60 * 1000
+const MAX_PID_FILE_AGE_MS = 2 * 60 * 1000   // PID 文件超过 2 分钟未更新 → 可疑
 const PID_FILENAME_RE = /^\d+\.json$/
 const HTTP_BUFFER_MS = 2000
 
@@ -76,6 +78,47 @@ function isProcessAlive(pid) {
   } catch (e) {
     return false
   }
+}
+
+// ── 批量验证 PID 是否属于 Node.js/Claude 进程 ─────
+// Windows PID 复用可能导致 process.kill(pid, 0) 误报
+// 用 WMIC 一批查出所有 PIDs 对应的进程名
+let _wmicAvailable = true
+let _wmicWarned = false
+
+function batchVerifyNodePids(pids) {
+  if (pids.length === 0) return Promise.resolve(new Set())
+  if (!_wmicAvailable) return Promise.resolve(new Set(pids))
+
+  const filter = pids.map(p => `ProcessId=${p}`).join(' or ')
+  const cmd = `wmic process where (${filter}) get ProcessId,Name /format:csv 2>nul`
+
+  return new Promise((resolve) => {
+    exec(cmd, { timeout: 5000, windowsHide: true }, (error, stdout) => {
+      if (error) {
+        if (!_wmicWarned) {
+          _wmicWarned = true
+          console.error('[sessions] wmic unavailable, trusting process.kill:', error.message)
+        }
+        _wmicAvailable = false
+        resolve(new Set(pids))
+        return
+      }
+      const valid = new Set()
+      for (const line of (stdout || '').split('\n')) {
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        const parts = trimmed.split(',')
+        if (parts.length < 3) continue
+        const name = (parts[1] || '').toLowerCase()
+        const wPid = parseInt(parts[2], 10)
+        if (wPid > 0 && (name === 'node.exe' || name === 'claude.exe')) {
+          valid.add(wPid)
+        }
+      }
+      resolve(valid)
+    })
+  })
 }
 
 // ── 转录路径解析 ──────────────────────────────────
@@ -201,7 +244,15 @@ class SessionManager extends EventEmitter {
   // ── 启动 / 停止轮询 ──────────────────────────────
   startPolling() {
     if (this._pollTimer) return
-    console.log('[sessions] starting PID poll + cleanup (every 500ms)')
+    console.log('[sessions] starting session detection (PID poll + process scan + lock scan)')
+    // Immediate first poll so sessions are visible when the window opens
+    try { this._pollPidFiles() } catch (e) { console.error('[sessions] poll error:', e.message) }
+    try { this._pollTranscriptTails() } catch (e) { console.error('[sessions] transcript error:', e.message) }
+    // One-time supplementary scans catch pre-existing sessions
+    try { this._scanLockFiles() } catch (e) { console.error('[sessions] lock scan error:', e.message) }
+    this._scanProcesses().catch(e => {
+      console.error('[sessions] process scan error:', e.message)
+    })
     this._pollTimer = setInterval(() => {
       try { this._pollPidFiles() } catch (e) { console.error('[sessions] poll error:', e.message) }
       try { this._pollTranscriptTails() } catch (e) { console.error('[sessions] transcript error:', e.message) }
@@ -232,11 +283,16 @@ class SessionManager extends EventEmitter {
       if (e.code !== 'ENOENT') {
         console.error('[sessions] failed to read PID dir:', e.message)
       }
-      // sessions 目录不存在 → 没有会话
       return
     }
 
+    const now = this._now()
     const liveIds = new Set()
+
+    // 第一遍：分类 — 新鲜/过期 + 存活/死亡
+    const freshRecords = []    // { record, pid }
+    const staleRecords = []    // { record, pid, filePath }
+    const deadFiles = []       // filePath
 
     for (const filename of entries) {
       if (!PID_FILENAME_RE.test(filename)) continue
@@ -244,38 +300,63 @@ class SessionManager extends EventEmitter {
       const filePath = path.join(PID_DIR, filename)
       const pidFromName = parseInt(filename.replace('.json', ''), 10)
 
-      let text
+      let text, stat
       try {
         text = fs.readFileSync(filePath, 'utf-8')
+        stat = fs.statSync(filePath)
       } catch (e) {
-        // 读取失败（可能正在写入）→ 跳过，下次重试
         continue
       }
 
-      // 检查进程存活
       if (!isProcessAlive(pidFromName)) {
-        // 进程已死 → 删除 PID 文件
-        this._sweepPidFile(filePath)
+        deadFiles.push(filePath)
         continue
       }
 
       const record = parsePidRecord(text)
-      if (!record) continue  // JSON 解析失败 → 跳过（可能正在写入）
+      if (!record) continue
 
-      record.pid = pidFromName  // 信任文件名中的 PID
+      record.pid = pidFromName
 
       if (!_loggedPidFields) {
         _loggedPidFields = true
         console.log('[sessions] PID record keys:', Object.keys(JSON.parse(text)).join(', '))
       }
 
+      // 判断 PID 文件新鲜度（mtime 或 updatedAt 任一在阈值内）
+      const fileFresh = (now - stat.mtimeMs) < MAX_PID_FILE_AGE_MS
+      const recency = record.updated_at_ms || 0
+      const recencyMs = recency > 1e12 ? recency : recency * 1000 // 秒 → 毫秒
+      const recordFresh = (now - recencyMs) < MAX_PID_FILE_AGE_MS
+
+      if (fileFresh || recordFresh) {
+        freshRecords.push({ record, pid: pidFromName })
+      } else {
+        staleRecords.push({ record, pid: pidFromName, filePath })
+      }
+    }
+
+    // 清理死进程的 PID 文件
+    for (const fp of deadFiles) {
+      this._sweepPidFile(fp)
+    }
+
+    // Upsert ALL process-alive records immediately (synchronous)
+    // process.kill(pid, 0) already confirmed the PID is alive.
+    // Stale-only means the PID file is old, not that the process is suspect.
+    for (const { record } of freshRecords) {
+      liveIds.add(record.session_id)
+      this._upsertFromPid(record)
+    }
+    for (const { record } of staleRecords) {
       liveIds.add(record.session_id)
       this._upsertFromPid(record)
     }
 
-    // 当前 sessions map 中有，但 liveIds 中没有 → 进程已退出
+    // Mark vanished sessions as stopped
     for (const [id, session] of this.sessions) {
       if (!liveIds.has(id) && session.status !== 'stopped') {
+        if (session.pid && isProcessAlive(session.pid)) continue
         console.log(`[sessions] PID vanished for ${id} → stopped`)
         session.status = 'stopped'
         session.stopped_at = this._now()
@@ -285,15 +366,175 @@ class SessionManager extends EventEmitter {
         this.emit('changed', session)
       }
     }
+
+    // Async backstop: verify stale PIDs belong to node.exe/claude.exe
+    // (Windows PID reuse can cause process.kill(pid, 0) to falsely report alive)
+    if (staleRecords.length > 0) {
+      const stalePids = staleRecords.map(r => r.pid)
+      batchVerifyNodePids(stalePids).then(verifiedPids => {
+        for (const { pid, filePath } of staleRecords) {
+          if (!verifiedPids.has(pid)) {
+            const sid = [...this.sessions.values()]
+              .find(s => s.pid === pid && s.status !== 'stopped')
+            if (sid) {
+              console.log(`[sessions] stale PID ${pid} not node/claude → stopping ${sid.session_id}`)
+              sid.status = 'stopped'
+              sid.stopped_at = this._now()
+              sid.stop_reason = sid.stop_reason || 'pid reused'
+              sid._just_stopped = true
+              setTimeout(() => { sid._just_stopped = false }, 3000)
+              this.emit('changed', sid)
+            }
+            this._sweepPidFile(filePath)
+          }
+        }
+      })
+    }
   }
 
   _sweepPidFile(filePath) {
     try { fs.unlinkSync(filePath) } catch (_) {}
   }
 
+  // ═══════════════════════════════════════════════════
+  // 进程表扫描 — 补充检测（借鉴 claudepot-app sysinfo/ps）
+  // ═══════════════════════════════════════════════════
+  async _scanProcesses() {
+    if (process.platform === 'win32') {
+      return this._scanProcessesWindows()
+    }
+    return this._scanProcessesUnix()
+  }
+
+  async _scanProcessesWindows() {
+    const cmd = 'wmic process get ProcessId,Name,CommandLine /format:csv 2>nul'
+    return new Promise((resolve) => {
+      exec(cmd, { timeout: 10000, windowsHide: true }, (error, stdout) => {
+        if (error) {
+          console.error('[sessions] process scan (wmic) failed:', error.message)
+          return resolve()
+        }
+        const candidates = []
+        const lines = (stdout || '').split('\n')
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          const parts = trimmed.split(',')
+          if (parts.length < 3) continue
+          // WMIC CSV: Node,Name,ProcessId
+          const name = (parts[1] || '').toLowerCase()
+          const pid = parseInt(parts[parts.length - 1], 10)
+          if (pid <= 0) continue
+          if (name === 'claude.exe') {
+            candidates.push(pid)
+          } else if (name === 'node.exe') {
+            // For node.exe, check if CommandLine contains 'claude'
+            const cmdLine = parts.slice(2, -1).join(',').toLowerCase()
+            if (cmdLine.includes('claude')) {
+              candidates.push(pid)
+            }
+          }
+        }
+        for (const pid of candidates) {
+          this._ingestScannedPid(pid)
+        }
+        resolve()
+      })
+    })
+  }
+
+  async _scanProcessesUnix() {
+    return new Promise((resolve) => {
+      exec('ps -axco pid,comm', { timeout: 10000 }, (error, stdout) => {
+        if (error) {
+          console.error('[sessions] process scan (ps) failed:', error.message)
+          return resolve()
+        }
+        const candidates = []
+        const lines = (stdout || '').split('\n')
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed || /^PID/i.test(trimmed)) continue
+          const m = trimmed.match(/^(\d+)\s+(.+)$/)
+          if (!m) continue
+          const pid = parseInt(m[1], 10)
+          const comm = (m[2] || '').toLowerCase()
+          if (pid > 0 && comm.includes('claude')) {
+            candidates.push(pid)
+          }
+        }
+        for (const pid of candidates) {
+          this._ingestScannedPid(pid)
+        }
+        resolve()
+      })
+    })
+  }
+
+  _ingestScannedPid(pid) {
+    if (!isProcessAlive(pid)) return
+    // Check if already tracked
+    for (const s of this.sessions.values()) {
+      if (s.pid === pid && s.status !== 'stopped') return
+    }
+    // Check if PID file exists (will be picked up by normal polling)
+    const pidFile = path.join(PID_DIR, `${pid}.json`)
+    try {
+      const text = fs.readFileSync(pidFile, 'utf-8')
+      const record = parsePidRecord(text)
+      if (record) {
+        record.pid = pid
+        this._upsertFromPid(record)
+        return
+      }
+    } catch (_) {}
+    // No PID file — create provisional entry
+    console.log(`[sessions] process scan found untracked pid=${pid}`)
+    this._createSessionFromProcess(pid)
+  }
+
+  // ═══════════════════════════════════════════════════
+  // 锁文件扫描 — 补充检测（借鉴 claudepot-app lock files）
+  // ═══════════════════════════════════════════════════
+  _scanLockFiles() {
+    const locksDir = path.join(os.homedir(), '.local', 'state', 'claude', 'locks')
+    let entries
+    try {
+      entries = fs.readdirSync(locksDir)
+    } catch (e) {
+      if (e.code !== 'ENOENT') {
+        console.error('[sessions] failed to read locks dir:', e.message)
+      }
+      return
+    }
+    for (const filename of entries) {
+      if (!filename.endsWith('.lock')) continue
+      const filePath = path.join(locksDir, filename)
+      let text
+      try { text = fs.readFileSync(filePath, 'utf-8') } catch (_) { continue }
+      let data
+      try { data = JSON.parse(text) } catch (_) { continue }
+      const lockPid = data.pid
+      if (!lockPid || lockPid <= 0) continue
+      this._ingestScannedPid(lockPid)
+    }
+  }
+
   _upsertFromPid(record) {
     const sid = record.session_id
     let session = this.sessions.get(sid)
+
+    // Replace any provisional entry that matches this PID.
+    if (!session) {
+      for (const [id, s] of this.sessions) {
+        if (s._from_process_scan && s.pid === record.pid) {
+          console.log(`[sessions] replacing provisional ${id} with real ${sid}`)
+          this.sessions.delete(id)
+          this._closeTranscriptTail(id)
+          break
+        }
+      }
+    }
 
     if (!session) {
       session = this._createSession(sid, record)
@@ -310,26 +551,48 @@ class SessionManager extends EventEmitter {
     session.pid = record.pid
     session.cwd = record.cwd || session.cwd
     session.started_at_ms = record.started_at_ms || session.started_at_ms
-    session.pid_status = record.status  // 'busy' | 'idle' | 'waiting' | null
+    // PID 文件是否被 CC 实际更新过（updatedAt 相比上次有变化）
+    const pidFileTouched = record.updated_at_ms && record.updated_at_ms !== session.pid_updated_at_ms
+
+    session.pid_status = record.status
     session.pid_waiting_for = record.waiting_for || null
-    if (record.name) session.display_name = session.display_name || record.name
+    session.pid_updated_at_ms = record.updated_at_ms || session.pid_updated_at_ms || this._now()
+    if (record.name) session.display_name = record.name
 
     // 用 PID 状态更新 session.status
+    // PID status is authoritative for state transitions when present.
+    // If PID disagrees with session, trust PID immediately — no guard needed.
+    // pidFileTouched only gates same-status refreshes (keep last_update fresh).
     const prevStatus = session.status
-    if (record.status === 'waiting') {
+
+    const pidTarget = record.status === 'waiting' ? 'waiting'
+                    : record.status === 'busy'   ? 'active'
+                    : record.status === 'idle'   ? 'idle'
+                    : null
+
+    if (pidTarget === 'waiting') {
       if (session.status !== 'waiting') {
         session._just_waiting = true
         setTimeout(() => { session._just_waiting = false }, 3000)
+        session._hidden = false
       }
       session.status = 'waiting'
       session.last_update = this._now()
-    } else if (record.status === 'busy') {
-      session.status = 'active'
-      session.last_update = this._now()
-    } else if (record.status === 'idle') {
-      session.status = 'idle'
-    } else {
-      // PID 无 status → 保持 current 或默认 active
+    } else if (pidTarget) {
+      if (pidTarget !== session.status) {
+        // PID disagrees with session → trust PID immediately.
+        // This handles idle→active when user resumes typing,
+        // even if updatedAt hasn't changed between polls.
+        if (pidTarget === 'active') {
+          session._hidden = false
+        }
+        session.status = pidTarget
+        session.last_update = this._now()
+      } else if (pidFileTouched) {
+        // Same status, PID file updated → keep last_update fresh.
+        session.last_update = this._now()
+      }
+    } else if (!record.status) {
       if (!session.pid_status && session.status === 'stopped') {
         session.status = 'active'
       }
@@ -342,6 +605,9 @@ class SessionManager extends EventEmitter {
 
   _createSession(sid, record) {
     console.log(`[sessions] new session from PID: ${sid} (pid ${record.pid})`)
+    // Use PID file timestamps when available so pre-existing sessions
+    // don't report "just now" when the monitor just started.
+    const now = this._now()
     return {
       session_id: sid,
       pid: record.pid,
@@ -358,17 +624,60 @@ class SessionManager extends EventEmitter {
       last_tool: '',
       recent_tools: [],
       stop_reason: '',
-      last_update: this._now(),
-      created_at: this._now(),
+      last_update: record.updated_at_ms || record.started_at_ms || now,
+      created_at: now,
       stopped_at: null,
       // PID 权威字段
       pid_status: record.status,
       pid_waiting_for: record.waiting_for || null,
+      pid_updated_at_ms: record.updated_at_ms || now,
       started_at_ms: record.started_at_ms || 0,
       // HTTP 补充字段
       _just_stopped: false,
-      _just_waiting: false
+      _just_waiting: false,
+      _hidden: false,
+      _from_process_scan: false
     }
+  }
+
+  // ── 从进程扫描创建临时 session（无 PID 文件时）─────────
+  _createSessionFromProcess(pid) {
+    const provisionalId = `proc-${pid}`
+    if (this.sessions.has(provisionalId)) return null
+    for (const s of this.sessions.values()) {
+      if (s.pid === pid && s.status !== 'stopped') return s
+    }
+    console.log(`[sessions] provisional entry: pid=${pid} (no PID file)`)
+    const now = this._now()
+    const session = {
+      session_id: provisionalId,
+      pid,
+      cwd: '',
+      display_name: `PID ${pid}`,
+      status: 'active',
+      model: 'unknown',
+      context_pct: 0,
+      cost: '',
+      duration: '',
+      last_event: 'ProcessScan',
+      last_tool: '',
+      recent_tools: [],
+      stop_reason: '',
+      last_update: now,
+      created_at: now,
+      stopped_at: null,
+      pid_status: null,
+      pid_waiting_for: null,
+      pid_updated_at_ms: null,
+      started_at_ms: 0,
+      _just_stopped: false,
+      _just_waiting: false,
+      _hidden: false,
+      _from_process_scan: true
+    }
+    this.sessions.set(provisionalId, session)
+    this.emit('changed', session)
+    return session
   }
 
   // ═══════════════════════════════════════════════════
@@ -472,6 +781,7 @@ class SessionManager extends EventEmitter {
     const event = data._event
     if (event) {
       session.last_event = event
+      // 不重置 _hidden：尊重用户手动 dismiss，PID 状态变化时自动恢复
       if (event === 'Stop') {
         session.status = 'stopped'
         session.stopped_at = session.stopped_at || this._now()
@@ -485,6 +795,7 @@ class SessionManager extends EventEmitter {
     const toolName = data.tool_name
     if (toolName) {
       session.last_tool = toolName
+      // 不重置 _hidden：尊重用户手动 dismiss，PID 状态变化时自动恢复
       session.recent_tools.push(toolName)
       if (session.recent_tools.length > 10) {
         session.recent_tools = session.recent_tools.slice(-10)
@@ -583,23 +894,21 @@ class SessionManager extends EventEmitter {
         continue
       }
 
-      // active → idle（仅当无 PID 权威状态）
-      if (session.status === 'active' && !session.pid_status) {
-        if (now - session.last_update > IDLE_THRESHOLD_MS) {
+      // active → idle
+      if (session.status === 'active') {
+        const pidStale = session.pid_status
+          && session.pid_updated_at_ms
+          && (now - session.pid_updated_at_ms > IDLE_THRESHOLD_MS)
+          && (now - session.last_update > IDLE_THRESHOLD_MS)
+        const noPidStatus = !session.pid_status
+          && (now - session.last_update > IDLE_THRESHOLD_MS)
+        if (pidStale || noPidStatus) {
           session.status = 'idle'
           this.emit('changed', session)
         }
       }
 
-      // idle → 过期清除
-      if (session.status === 'idle') {
-        if (now - session.last_update > EXPIRE_IDLE_MS) {
-          console.log(`[sessions] removing idle: ${id}`)
-          this._closeTranscriptTail(id)
-          this.sessions.delete(id)
-          this.emit('changed', null)
-        }
-      }
+      // idle 不自动清除 — 等待进程死亡或用户手动删除
     }
   }
 
@@ -612,20 +921,19 @@ class SessionManager extends EventEmitter {
   }
 
   remove(session_id) {
-    // 清除对应的 PID 文件
+    // 只是从面板隐藏，不杀进程、不删 PID 文件
+    // 会话有新活动时自动重新显示
     const session = this.sessions.get(session_id)
-    if (session && session.pid) {
-      const pidFile = path.join(PID_DIR, `${session.pid}.json`)
-      this._sweepPidFile(pidFile)
+    if (session) {
+      session._hidden = true
     }
-    this._closeTranscriptTail(session_id)
-    this.sessions.delete(session_id)
     this.emit('changed', null)
   }
 
   getAll() {
     this._cleanup()
     const list = Array.from(this.sessions.values())
+      .filter(s => !s._hidden)  // 隐藏的不显示
     const order = { waiting: 0, active: 1, idle: 2, stopped: 3 }
     list.sort((a, b) => {
       const d = order[a.status] - order[b.status]

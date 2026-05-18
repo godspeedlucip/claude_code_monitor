@@ -98,13 +98,12 @@ function renderCard(session) {
 
   return `
     <div class="card ${status}${extraClassStr}"
-         data-session-id="${session_id}"
-         ${status === 'stopped' ? 'onclick="toggleStoppedCard(event, this)"' : ''}>
+         data-session-id="${session_id}">
       <div class="card-header">
         <span class="status-indicator ${statusLabel}"></span>
         <span class="card-title">${statusLabel} ${escHtml(title)}</span>
         ${status === 'stopped' ? '<span class="expand-hint">▼</span>' : ''}
-        <button class="dismiss-btn" onclick="dismissCard(event, '${session_id}')" title="Remove">×</button>
+        <button class="dismiss-btn" title="Remove">×</button>
       </div>
       ${waitingText}
       <div class="card-details">
@@ -128,15 +127,26 @@ function escHtml(s) {
   return String(s).replace(/[&<>"']/g, c => m[c])
 }
 
-function toggleStoppedCard(event, el) {
-  // 不阻止 × 按钮冒泡
-  if (event.target.classList.contains('dismiss-btn')) return
-  el.classList.toggle('expanded')
-}
-
-async function dismissCard(event, session_id) {
-  event.stopPropagation()
-  await window.monitorAPI.removeSession(session_id)
+function setupCardEvents() {
+  const container = document.getElementById('cards-container')
+  if (!container._eventsSetup) {
+    container._eventsSetup = true
+    container.addEventListener('click', async (event) => {
+      const dismissBtn = event.target.closest('.dismiss-btn')
+      if (dismissBtn) {
+        event.stopPropagation()
+        const card = dismissBtn.closest('.card')
+        if (card) {
+          await window.monitorAPI.removeSession(card.dataset.sessionId)
+        }
+        return
+      }
+      const card = event.target.closest('.card.stopped')
+      if (card) {
+        card.classList.toggle('expanded')
+      }
+    })
+  }
 }
 
 // ── 渲染 ───────────────────────────────────
@@ -169,6 +179,7 @@ function render(sessions) {
   if (hasAlert) playBeep()
 
   container.innerHTML = sessions.map(renderCard).join('')
+  setupCardEvents()
 
   expandedIds.forEach(id => {
     const el = container.querySelector(`.card[data-session-id="${id}"]`)

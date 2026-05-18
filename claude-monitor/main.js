@@ -289,11 +289,15 @@ app.whenReady().then(async () => {
   setupSingleInstance()
   setupIPC()
 
+  // Session polling must always start, regardless of HTTP server availability.
+  sessions.startPolling()
+
+  // HTTP server is optional enrichment; failure must not block session detection.
   try {
     await startServer()
-    sessions.startPolling()
   } catch (e) {
-    console.error('[app] failed to start server:', e.message)
+    console.error('[app] failed to start HTTP server:', e.message)
+    console.error('[app] HTTP enrichment unavailable — PID polling + process scan active')
   }
 
   createWindow()

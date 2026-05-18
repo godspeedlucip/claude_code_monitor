@@ -14,7 +14,10 @@
       "Bash(tasklist //FI \"IMAGENAME eq electron.exe\")",
       "Bash(netstat -ano)",
       "Bash(kill -15 21508)",
-      "Bash(taskkill //F //IM electron.exe)"
+      "Bash(taskkill //F //IM electron.exe)",
+      "Bash(node -e \"const s = require\\('./sessions'\\); console.log\\('Syntax OK, sessions module loaded'\\); console.log\\('Polling active:', !!s._pollTimer\\)\")",
+      "Bash(node -e \"const s = require\\('./sessions'\\); console.log\\('OK'\\)\")",
+      "Bash(git *)"
     ]
   }
 }
